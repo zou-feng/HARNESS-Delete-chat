@@ -1,0 +1,11 @@
+# dsh-plugin-conversation-delete bundle patch: one loader row for the Host half.
+# The browser half rides this package's own `dsh.client` declaration, so the
+# profile needs no other wiring — `plugin_manager install_bundle` puts this
+# package into `dsh.profile.bundles` and the row below mounts with it.
+#
+# NOTE: this file must not start with a UTF-8 BOM. The profile patch parser
+# rejects a BOM-prefixed document with "must be a top-level YAML array of
+# loader patch entries", which fails the whole server boot.
+- insert:
+    - id: conversation-delete
+      name: dsh-plugin-conversation-delete

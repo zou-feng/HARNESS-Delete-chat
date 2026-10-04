@@ -1,0 +1,45 @@
+{
+  "name": "dsh-plugin-conversation-delete",
+  "version": "1.0.0",
+  "private": true,
+  "description": "在会话行的“...”更多菜单里新增“删除对话”，同时删除该会话在磁盘上的记录文件。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./client": {
+      "default": "./client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "meta": {
+    "title": "删除对话",
+    "description": "右键会话行的“...”菜单即可彻底删除该对话及其磁盘文件。"
+  },
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "session",
+    "delete"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,4 @@
+{
+  "title": "Delete conversation",
+  "description": "Adds a \"Delete conversation\" row to the session \"...\" menu that also removes the conversation's on-disk session files."
+}
