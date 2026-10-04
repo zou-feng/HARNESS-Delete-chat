@@ -1,0 +1,22 @@
+# 依赖与安装产物（本插件运行时零依赖，正常情况下不产生这些）
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# 打包产物：只作为 Release 附件上传，不进版本库
+*.tgz
+*.tar.gz
+*.zip
+
+# 临时 / 试跑文件
+_scratch/
+*.log
+*.tmp
+
+# 操作系统与编辑器垃圾
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*~
