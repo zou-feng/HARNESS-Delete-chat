@@ -4,6 +4,9 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+
+
+
 ## [1.1.0] - 2026-10-06
 
 菜单从「一行」变成一个**对话工具箱**：导出对话、打开对话文件位置、更换工作区、删除对话，
@@ -111,6 +114,63 @@
   （本机尚无该目录，属尽力而为）；被 GUI 打开过的会话删除后仍需重启才会从 Host 内存里消失
   （见 1.0.0 的说明与 README「设计要点 1」）；**更换工作区**要求目标工作区目录当前存在，
   且该会话不在 Host 内存里（开着就先关掉再换）。
+
+### 1.1.0 覆盖发布追加的修复
+
+以下三项是 1.1.0 首次发布之后，在**真实的桌面版环境**里踩出来并修掉的，已于同日**覆盖更新到同一个 1.1.0 发布**里（不另开版本、不另开分支）：
+
+- **换区之后新旧两个工作区都列着这条对话（点一个亮两个）**：摘旧账时我用
+  workspace.sessionIds.includes(id) 预判「旧工作区账上有没有它」，但桌面版里那个 getter
+  会**按 cwd 过滤** —— 搬完之后旧工作区根本看不见这条会话，预判永远 false，整段 detach 被跳过，
+  于是旧账上那条 id 一直留着。**同一个缺陷也正是之前 workspace.json 损坏的原因**
+  （一条会话挂在两个工作区 → 注册表加载时抛异常 → workspaceController 服务不可用）。
+  现在：detach 契约是幂等的（不在账上也不写），所以对**其它每个工作区直接调一次**，
+  方法名按能力探测（detachSession / emoveSession / detach / orgetSession），
+  并在结束后**回读确认**没有别的账上还留着它（留了就记进 ailures 的 detach-verify）。
+
+- **桌面版报 The "path" argument must be of type string. Received an instance of Object**：
+  新版 DSH 里服务暴露的路径**不一定是裸字符串** —— 桌面版实测返回对象，web 版返回字符串，
+  所以这个坑只在桌面版暴露。path.resolve() 拿到对象会直接抛。
+  现在所有来自服务的路径都先经 pathText() 收敛（兼容字符串、{ path } 包装、
+  有意义的 	oString()），覆盖 workspace.path、	arget.path、
+  sessionPersistence.locate().path、后端 config.root / oot 字段；
+  locate() 的返回值统一走 locateTextOf()。
+
+- **多代际会话搬迁必然失败**（用户实测抓到）：一个会话目录里可以**同时**躺着
+  `session.v3.jsonl.zstd`（历史代际）与 `session.v4.jsonl.zstd`（当前代际），v3 同样是合法代际。
+  原先只把「定位到的那一个文件」改名 aside，v3 留在旧目录里 → 后端在两个项目目录里各找到这条
+  会话 → 抛 `duplicate JSONL session id … appears in multiple project directories` →
+  回读验证失败并回滚。
+  现在改为**把旧目录里的每个条目都搬进新目录**（多代际一起走，无损），旧目录空掉后再删。
+  也不能改成「整个目录改名 aside」：`listSessionDirs()` 会列所有目录且不校验目录名。
+- **注册表的内存头缓存没跟着搬**（用户实测抓到）：`attachSession()` 通过
+  `host.readSessionHeader(id)` 拿 cwd，顺序是「活会话 → **内存缓存** → 扫盘」，
+  **缓存命中就不扫盘**。搬迁只改磁盘、不清缓存，它就会拿**旧 cwd** 去 `realpath()` 并报
+  `its cwd '<旧路径>' does not resolve, so it cannot be validated` —— 文件其实已经搬好了。
+  现在搬迁成功后（以及回滚后）先让缓存失效，接口按能力探测，并用 `stat()` 重试兜底。
+- **搬迁误依赖客户端网关**：原来「为目录建工作区」走浏览器半的 `workspaces.create`
+  （typert 网关 → `workspaceController`），在没有挂这个服务的组合里直接报
+  `gateway/service-unavailable: … active Service "workspaceController" is unavailable`。
+  现在客户端只把**目录路径**交给 `/move`，由 Host 用注册表自己「找/建」工作区。
+- **删除的归档步骤也是 strict 查找**：在拿不到注册表的组合里会**静默跳过归档**
+  （删掉的对话在重启前可能又回到列表）。现在与换区共用同一个多路兜底。
+- **失败明细不再被吞掉**：弹窗会附上 Host 的 `failures[{step,error}]`，
+  否则用户只会看到一句「搬迁未能验证，已回滚」，根本看不出是哪一步。
+- **服务解析多路兜底**：`ctx` → `ctx.root` × strict / 非 strict × 若干候选名字。
+  Cordis 4 的 `ctx.get(name)` 默认 strict（只认「提供者当前 active」的实现），
+  且服务可能被隔在别的 `isolate` 作用域里。命中来源会记进报告（`registrySource`）。
+- **只读能力探测路由** `POST /conversation-delete/capabilities`：逐个报告服务能否解析、
+  解析来源、注册表里的工作区清单、会话根目录。用于回答「这个 DSH 组合里到底哪个功能能用」。
+- **手输目标路径**：目录选择器在某些组合里不可用时的退路（`uiWorkspace.pickDirectory`）。
+- 弹窗打开时先探测一次能力：拿不到注册表就直接说明，而不是等你选完目录再失败。
+- **实测差异（同一份代码、同一个 DSH 版本 `0.2.0-rc.2`）**：
+  web profile 里 `sessions` / `sessionPersistence` / `sessionController` / `webServer` /
+  `workspaceRegistry` **全部可用**；桌面版的**插件 Host** 里只有
+  `sessions` / `sessionPersistence` / `webServer` / `typert` 可用，
+  `workspaceRegistry` 与 `sessionController` **都拿不到**（四个候选名字 + 非 strict + `ctx.root`
+  全试过）。因此在那套组合里：**删除 / 导出 / 导入可用**，
+  **更换工作区与打开文件位置不可用**（插件会明确说明原因，不再抛网关错误）。
+
 
 ## [1.0.0] - 2026-10-04
 

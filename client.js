@@ -43,6 +43,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
       var IMPORT_URL = '/conversation-delete/import'
       var REVEAL_URL = '/conversation-delete/reveal'
       var MOVE_URL = '/conversation-delete/move'
+      /** 只读的能力探测路由：Host 用它回答「这个组合里换区到底能不能用」。 */
+      var CAPABILITIES_URL = '/conversation-delete/capabilities'
       var STYLE_TAG_ID = 'dsh-plugin-conversation-delete/styles'
       /** What the import file picker accepts. */
       var IMPORT_ACCEPT = '.zip,.jsonl,.zstd'
@@ -82,9 +84,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         'move.pick': '选择目录…',
         'move.pickHint': '也可以直接选一个目录：会为它建立（或复用）一个工作区，然后把这条对话搬过去。',
         'move.currentDir': '当前目录：{path}',
-        'move.noPicker': '这个组合里没有目录选择器（uiWorkspace.pickDirectory 不可用）。',
-        'move.noCreate': '这个组合里不能建立工作区（workspaces.create 不可用）。',
-        'move.noWorkspace': '为该目录建立工作区后没有拿到 id。',
+        'move.noPicker': '这个组合里没有目录选择器（uiWorkspace.pickDirectory 不可用）—— 也可以直接在下面手输路径。',
+        'move.noRegistry': '这个 DSH 组合没有把工作区注册表（workspaceRegistry）暴露给插件，所以「更换工作区」在这里用不了。web 版（较旧的组合）可以。',
+        'move.pathPlaceholder': '或者直接输入目标目录的完整路径',
+        'move.go': '移动到这里',
         'notice.title': '无法打开文件位置',
         'notice.path': '对话文件路径：',
         'copy': '复制路径',
@@ -130,9 +133,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         'move.pick': 'Choose a folder…',
         'move.pickHint': 'You can also pick a folder directly: a workspace is created (or reused) for it, then the conversation moves there.',
         'move.currentDir': 'Current directory: {path}',
-        'move.noPicker': 'This composition has no directory picker (uiWorkspace.pickDirectory is unavailable).',
-        'move.noCreate': 'This composition cannot create workspaces (workspaces.create is unavailable).',
-        'move.noWorkspace': 'Creating a workspace for that folder returned no id.',
+        'move.noPicker': 'This composition has no directory picker (uiWorkspace.pickDirectory is unavailable) — you can type the path below instead.',
+        'move.noRegistry': 'This DSH composition does not expose the workspace registry (workspaceRegistry) to plugins, so "Move to workspace" cannot work here. The web profile (older composition) can.',
+        'move.pathPlaceholder': 'Or type the full path of the target directory',
+        'move.go': 'Move here',
         'notice.title': 'Could not show the file location',
         'notice.path': 'Conversation file path:',
         'copy': 'Copy path',
@@ -216,6 +220,13 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         '.dshcd-ws:disabled{cursor:default;opacity:.6}',
         '.dshcd-ws-title{font-size:13px;line-height:18px}',
         '.dshcd-ws-path{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);word-break:break-all}',
+        /* 手输路径（目录选择器不可用时的退路） */
+        '.dshcd-path-row{display:flex;align-items:center;gap:8px;padding:12px 16px 0}',
+        '.dshcd-path-input{flex:1 1 auto;min-width:0;height:32px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);',
+        'border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);',
+        'font-family:inherit;font-size:12px;line-height:18px}',
+        '.dshcd-path-input::placeholder{color:var(--dsw-alias-label-secondary)}',
+        '.dshcd-path-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
       ].join('')
 
       /** Install this plugin's stylesheet once; the returned disposer removes it. */
@@ -678,12 +689,30 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var [busy, setBusy] = React.useState(false)
         var [error, setError] = React.useState(null)
         var [result, setResult] = React.useState(null)
+        var [typedPath, setTypedPath] = React.useState('')
+        var [capabilities, setCapabilities] = React.useState(null)
         var useWorkspaces = typeof props.useWorkspaces === 'function' ? props.useWorkspaces : emptyHook
         var useSessions = typeof props.useSessions === 'function' ? props.useSessions : emptyHook
         /* 选择器本身也要防 undefined：快照还没到位时抛异常会让整个槽位条目崩掉（弹窗直接不出现） */
         var workspaces = useWorkspaces(function (snapshot) { return snapshot === null || snapshot === undefined ? undefined : snapshot.items })
         var byId = useSessions(function (state) { return state === null || state === undefined ? undefined : state.byId })
         var close = function () { if (!busy) props.store.close() }
+
+        /*
+         * 先问 Host「你这个组合里到底能不能换区」。
+         * 桌面版（较新的 DSH）拿不到 workspaceRegistry，光看报错根本看不出是哪一层的问题，
+         * 所以这里提前问一次，把这个事实直接显示在弹窗里。
+         */
+        React.useEffect(function () {
+          var alive = true
+          postJson(CAPABILITIES_URL, {}).then(
+            function (answer) { return answer.body },
+            function () { return null },
+          ).then(function (body) {
+            if (alive && body !== null && body !== undefined && body.workspaceRegistry !== undefined) setCapabilities(body)
+          })
+          return function () { alive = false }
+        }, [])
 
         var summary = byId !== null && byId !== undefined ? byId[request.sessionId] : undefined
         var currentCwd = summary !== undefined && summary !== null && typeof summary.cwd === 'string' ? summary.cwd : undefined
@@ -714,16 +743,18 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           )
         }
 
-        /** 打开宿主目录选择器 → 建立/复用工作区 → 搬到那里。 */
+        /**
+         * 打开宿主目录选择器 → 把**目录本身**交给 Host 去建/找对应的工作区。
+         *
+         * 以前这里调客户端的 `workspaces.create`，它走 typert 网关 → `workspaceController`
+         * 这个 Service；桌面版组合里这条路直接报 `gateway/service-unavailable`。
+         * 既然 Host 半本来就要用注册表改账户归属，"找/建工作区" 一起放到 Host，既少一次往返，
+         * 也不再受客户端组合差异影响。
+         */
         var pickDirectoryAndMove = function () {
           var uiWorkspace = ctx.get('uiWorkspace')
-          var workspaceService = ctx.get('workspaces')
           if (uiWorkspace === undefined || typeof uiWorkspace.pickDirectory !== 'function') {
             setError(t('move.noPicker'))
-            return
-          }
-          if (workspaceService === undefined || typeof workspaceService.create !== 'function') {
-            setError(t('move.noCreate'))
             return
           }
           setBusy(true)
@@ -734,28 +765,39 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
               if (path === null || path === undefined || path === '') {
                 /* 用户取消了选择 */
                 setBusy(false)
-                return null
+                return
               }
-              return Promise.resolve(workspaceService.create({ path: path })).then(
-                function (view) {
-                  var workspaceId = view !== null && view !== undefined
-                    ? (view.workspaceId !== undefined ? view.workspaceId : (view.workspace !== undefined ? view.workspace.workspaceId : undefined))
-                    : undefined
-                  if (workspaceId === undefined) throw new Error(t('move.noWorkspace'))
-                  setBusy(false)
-                  return move(workspaceId)
-                },
-                function (reason) {
-                  setBusy(false)
-                  setError(messageOf(reason))
-                },
-              )
+              setBusy(false)
+              moveByPath(String(path))
             },
             function (reason) {
               setBusy(false)
               setError(messageOf(reason))
             },
           )
+        }
+
+        /** 直接把一个路径交给 Host（目录选择器和手输路径都走这条）。 */
+        var moveByPath = function (path) {
+          setBusy(true)
+          setError(null)
+          setResult(null)
+          postJson(MOVE_URL, { sessionId: request.sessionId, path: path }).then(expectOk).then(
+            function (report) {
+              setBusy(false)
+              setResult(report)
+              var sessions = ctx.get('sessions')
+              if (sessions !== undefined && typeof sessions.refresh === 'function') {
+                Promise.resolve(sessions.refresh()).catch(function () {})
+              }
+            },
+            function (reason) { setBusy(false); setError(messageOf(reason)) },
+          )
+        }
+
+        var submitTypedPath = function () {
+          var value = String(typedPath).trim()
+          if (value !== '' && !busy) moveByPath(value)
         }
 
         var items = Array.isArray(workspaces) ? workspaces : []
@@ -776,6 +818,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
 
         return h(DialogShell, { t: t, title: t('move.title'), busy: busy, onClose: close, footer: footer },
           h('p', { className: 'dshcd-desc' }, t('move.desc')),
+          capabilities !== null && capabilities.workspaceRegistry.available !== true
+            && h('p', { className: 'dshcd-error', role: 'alert' }, t('move.noRegistry')),
           currentCwd !== undefined && h('p', { className: 'dshcd-note' }, t('move.currentDir', { path: currentCwd })),
           h('p', { className: 'dshcd-note' }, t('move.pickHint')),
           busy && h('p', { className: 'dshcd-note', role: 'status' }, t('move.pending')),
@@ -795,6 +839,25 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
               ),
             )
           })),
+          /* 手输路径：目录选择器在某些组合里可能不可用，这条永远在 */
+          h('div', { className: 'dshcd-path-row' },
+            h('input', {
+              className: 'dshcd-path-input',
+              type: 'text',
+              placeholder: t('move.pathPlaceholder'),
+              'aria-label': t('move.pathPlaceholder'),
+              value: typedPath,
+              disabled: busy,
+              onChange: function (event) { setTypedPath(String(event.target.value)) },
+              onKeyDown: function (event) {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  submitTypedPath()
+                }
+              },
+            }),
+            h(DialogButton, { key: 'go', disabled: busy || String(typedPath).trim() === '', onClick: submitTypedPath }, t('move.go')),
+          ),
         )
       }
 

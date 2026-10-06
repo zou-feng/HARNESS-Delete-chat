@@ -144,11 +144,21 @@ async function main() {
   check("inject 包含 'webServer'", /export const inject = \['webServer'\]/.test(host))
   check('导出 apply(ctx, config)', /export function apply\(ctx, config\)/.test(host))
   check('从 ./format.js 引入格式层', /from '\.\/format\.js'/.test(host))
-  for (const routePath of ['/conversation-delete/delete', '/conversation-delete/export', '/conversation-delete/import', '/conversation-delete/reveal', '/conversation-delete/move']) {
+  for (const routePath of ['/conversation-delete/delete', '/conversation-delete/export', '/conversation-delete/import', '/conversation-delete/reveal', '/conversation-delete/move', '/conversation-delete/capabilities']) {
     check('注册路由 ' + routePath, host.includes(`path: '${routePath}'`))
   }
-  // 五条路由共用三个处理器（delete/reveal/move 走同一张 jsonRoutes 表），每个处理器各有一道 POST 闸门。
+  // 六条路由共用三个处理器（delete/reveal/move/capabilities 走同一张 jsonRoutes 表），每个处理器各有一道 POST 闸门。
   check('每条路由都拒绝非 POST', (host.match(/POST required/g) || []).length >= 3)
+  /*
+   * Cordis 4 的 `ctx.get(name)` 默认 strict（只认提供者当前 active 的实现），而且服务可能被隔在别的
+   * isolate 作用域里、或新版改了名字 —— 桌面版就是这样，同一个插件在 web 上拿得到 registry、
+   * 在桌面版拿到 undefined。所以查找必须多路兜底，并且要有能力探测路由把真相吐出来。
+   */
+  check('registry 查找多路兜底（ctx / ctx.root × strict / 非 strict × 候选名字）', /function resolveWorkspaceRegistry\(ctx\)/.test(host) && host.includes("'workspaceRegistry', 'workspaceController'") && /ctx\.root/.test(host) && /scope\.get\(name, strict\)/.test(host))
+  check('registry 命中来源会记进报告', host.includes('report.registrySource = found.source'))
+  check('Host 侧自己找/建工作区（不再依赖客户端网关）', /async function ensureWorkspaceForPath\(registry, targetPath\)/.test(host) && host.includes('registry.create({ path: canonical })'))
+  check('/move 支持只给 path', host.includes('moveConversation(ctx, config, body.sessionId, body.workspaceId, body.path)'))
+  check('能力探测路由报告服务解析结果', /async function capabilitiesReport\(ctx, config\)/.test(host) && host.includes('workspaceCreate:') && host.includes('workspaceRegistry: { available:'))
   check('归档时带 stopActivity: true', /archiveSession\(sessionId, \{ stopActivity: true \}\)/.test(host))
   check('广播 api-session/removed', host.includes("ctx.emit('api-session/removed', sessionId)"))
   check('删目录用递归 force', /await rm\(dir, \{ recursive: true, force: true \}\)/.test(host))
@@ -174,6 +184,23 @@ async function main() {
   check('回读验证必须指向新路径', /resolve\(afterPath\) === newPath/.test(host))
   check('验证失败整体回滚（含按原字节写回权威代际）', host.includes('the move could not be verified and was rolled back') && host.includes('restoreAuthoritative') && /await writeFile\(authoritativeInOld, originalBytes\)/.test(host))
   check('台账：搬走的条目数会回报', host.includes('report.movedEntries = moves.length'))
+  /*
+   * 「移动后新旧两个工作区都列出这条对话、点一个亮两个」的根：摘旧账时用 sessionIds 预判，
+   * 桌面版那个 getter 按 cwd 过滤 —— 搬完旧工作区根本看不见它，预判 false，detach 被整段跳过。
+   * detach 契约是幂等的，所以对每个其它工作区直接调一次，并回读确认。
+   */
+  check('摘除不再用 sessionIds 预判（幂等直调 + 候选方法名）', host.includes("['detachSession', 'removeSession', 'detach', 'forgetSession']") && /function pickWorkspaceMethod\(workspace, names\)/.test(host))
+  check('摘除后有回读确认（别的账上不该再留着它）', host.includes("step: 'detach-verify'") && host.includes('still accounted by workspace(s)'))
+  check('摘除结果会回报（detachedFrom）', host.includes('report.detachedFrom = detachedFrom'))
+  /*
+   * 桌面版踩出来的：新版 DSH 里服务暴露的路径**不一定是字符串**（web 版是字符串，
+   * 所以只在桌面版暴露）。`path.resolve(那个对象)` 会直接抛
+   * `The "path" argument must be of type string. Received an instance of Object`。
+   */
+  check('服务返回的路径统一收敛成字符串（pathText / locateTextOf）', /function pathText\(value\)/.test(host) && /function locateTextOf\(located\)/.test(host))
+  check('不再裸用服务给的 paths（workspace.path / target.path / located.path）', /resolve\(workspace\.path\)/.test(host) === false && /resolve\(target\.path\)/.test(host) === false && /resolve\(located\.path\)/.test(host) === false)
+  check('locate() 的结果一律走 locateTextOf', (host.match(/locateTextOf\(/g) || []).length >= 4)
+  check('pathText 兼容 { path } 包装与 toString', host.includes("if (typeof value.path === 'string' && value.path !== '') return value.path") && host.includes("if (text !== '' && text !== '[object Object]') return text"))
   check('成功才清理旧目录', /await rm\(oldDir, \{ recursive: true, force: true \}\)/.test(host))
   check('原地改 cwd（两个 cwd 映射到同一项目目录）不当成搬家', /const sameDirectory = resolve\(oldDir\) === resolve\(newDir\)/.test(host))
   check('账户归属走 attachSession/detachSession', /await target\.attachSession\(sessionId\)/.test(host) && /workspace\.detachSession\(sessionId\)/.test(host))
@@ -245,8 +272,15 @@ async function main() {
   check('槽位 hook 缺失时有兜底（不让弹窗崩掉）', client.includes('typeof props.useWorkspaces === ') && client.includes('function emptyHook('))
   check('更换工作区把当前工作区标为不可选', client.includes("t('move.current')") && /disabled: busy \|\| isCurrent/.test(client))
   // 只列已有工作区是不够的：注册表里常常只有一个（当前那个），必须能直接指定位置。
-  check('更换工作区能直接选一个目录（目录选择器 + 建/复用工作区）', client.includes('uiWorkspace.pickDirectory()') && client.includes('workspaceService.create({ path: path })'))
-  check('目录选择器 / 建区 / 拿不到 id 都有明确报错', client.includes("t('move.noPicker')") && client.includes("t('move.noCreate')") && client.includes("t('move.noWorkspace')"))
+  check('更换工作区能直接选一个目录（目录选择器 + 把路径交给 Host）', client.includes('uiWorkspace.pickDirectory()') && client.includes('moveByPath(String(path))'))
+  /*
+   * 这一段是桌面版踩出来的：客户端的 `workspaces.create` 走 typert 网关 → workspaceController，
+   * 桌面版组合里那条路直接报 gateway/service-unavailable。所以「找/建工作区」挪到 Host（用注册表），
+   * 客户端只把目录路径交给 /move。
+   */
+  check('换区不再依赖客户端网关的 workspace/create', client.includes('workspaceService.create') === false && client.includes('postJson(MOVE_URL, { sessionId: request.sessionId, path: path })'))
+  check('目录选择器缺失时也能手输路径', client.includes("t('move.noPicker')") && client.includes("t('move.pathPlaceholder')") && client.includes('submitTypedPath'))
+  check('弹窗打开时先问一次能力，并显示 registry 不可用', client.includes('CAPABILITIES_URL') && client.includes("t('move.noRegistry')"))
   check('hook 选择器自身也防 undefined（避免条目崩掉）', client.includes('snapshot === null || snapshot === undefined ? undefined : snapshot.items'))
   check('失败时把 Host 的失败明细一起显示给用户', client.includes("message += '\\n· ' + String(failure.step)"))
   check('删除行仍是危险色', /danger: true/.test(client))
@@ -261,6 +295,14 @@ async function main() {
   check('删除前先调用宿主的归档动作', client.includes('uiWorkspace.archiveSession(sessionId, { stopActivity: true })'))
   check('操作后刷新会话目录', client.includes('sessions.refresh()'))
   check('定位失败时给出可复制路径', client.includes('navigator.clipboard') && client.includes("'dshcd-path'"))
+  /*
+   * 桌面版的插件 Host 没有 sessionController（实测），「打开文件位置」因此用不了。
+   * 兜底是自己叫系统文件管理器：必须走参数数组（不经过 shell）、必须挂 'error' 处理
+   * （ChildProcess 的 'error' 事件没有监听者会直接抛出来把宿主带崩）、必须 unref 不占住宿主。
+   */
+  check('没有 sessionController 时自己叫文件管理器', /function spawnReveal\(target\)/.test(host) && host.includes("spawn(command, args, { stdio: 'ignore', detached: true, windowsHide: true })"))
+  check('spawn 兜底挂了 error 处理并 unref', host.includes("child.on('error', () => {})") && host.includes('child.unref()'))
+  check('spawn 兜底是跨平台的（explorer / open -R / xdg-open）', host.includes('/select,') && host.includes("args = ['-R', target]") && host.includes('args = [dirname(target)]'))
   check('不 require 宿主 primitives', client.includes("require('@deepseek-ai/dsh-client-ui-primitives')") === false)
 
   /* --------------------------------------------------------- 8 主题令牌 */

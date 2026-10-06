@@ -24,8 +24,9 @@
  *
  * @module dsh-plugin-conversation-delete
  */
+import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
@@ -87,13 +88,52 @@ function delay(ms) {
 }
 
 /**
+ * 把「服务给回来的路径」收敛成字符串。
+ *
+ * 为什么需要它：新版 DSH 里服务暴露的路径**不一定是裸字符串**。桌面版实测会返回对象，
+ * 于是 `path.resolve(那个对象)` 直接抛
+ * `The "path" argument must be of type string. Received an instance of Object`。
+ * web 版返回的是字符串，所以这个坑只在桌面版暴露出来。
+ *
+ * 兼容三种形态：字符串本身、`{ path }` 包装、以及有意义的 `toString()`（品牌化路径类）。
+ * @param value - whatever a service handed back.
+ * @returns 可用的路径字符串；读不出字符串时返回 undefined。
+ */
+function pathText(value) {
+  if (typeof value === 'string') return value === '' ? undefined : value
+  if (value === null || value === undefined) return undefined
+  if (typeof value === 'object') {
+    if (typeof value.path === 'string' && value.path !== '') return value.path
+    if (typeof value.toString === 'function') {
+      const text = String(value)
+      if (text !== '' && text !== '[object Object]') return text
+    }
+    return undefined
+  }
+  return undefined
+}
+
+/**
+ * 从 `backend.locate()` 的返回值里取出路径字符串（桌面版返回的对象也能吃）。
+ * @param located - the service's locate() result.
+ * @returns 路径字符串；读不出来就 undefined。
+ */
+function locateTextOf(located) {
+  if (located === null || located === undefined) return undefined
+  const fromField = pathText(located.path)
+  if (fromField !== undefined) return fromField
+  return pathText(located)
+}
+
+/**
  * Resolve one directory root: plugin config, then an already-computed default,
  * then `$DSH_HOME/<leaf>`, then `~/.dsh/<leaf>`.
  */
 function resolveRoot(config, key, precomputed, leaf) {
-  const configured = config === null || typeof config !== 'object' ? undefined : config[key]
-  if (typeof configured === 'string' && configured.trim() !== '') return resolve(configured.trim())
-  if (typeof precomputed === 'string' && precomputed.trim() !== '') return resolve(precomputed.trim())
+  const configured = config === null || typeof config !== 'object' ? undefined : pathText(config[key])
+  if (configured !== undefined && configured.trim() !== '') return resolve(configured.trim())
+  const fallback = pathText(precomputed)
+  if (fallback !== undefined && fallback.trim() !== '') return resolve(fallback.trim())
   const home = process.env.DSH_HOME
   if (typeof home === 'string' && home.trim() !== '') return join(resolve(home.trim()), leaf)
   return join(homedir(), '.dsh', leaf)
@@ -102,10 +142,10 @@ function resolveRoot(config, key, precomputed, leaf) {
 /** The backend's own resolved root (class field `root`), when the proxy exposes it. */
 function backendRootOf(backend) {
   if (backend === null || backend === undefined) return undefined
-  const fromConfig = backend.config?.root
-  if (typeof fromConfig === 'string' && fromConfig.trim() !== '') return fromConfig.trim()
-  const fromField = backend.root
-  if (typeof fromField === 'string' && fromField.trim() !== '') return fromField.trim()
+  const fromConfig = pathText(backend.config?.root)
+  if (fromConfig !== undefined && fromConfig.trim() !== '') return fromConfig.trim()
+  const fromField = pathText(backend.root)
+  if (fromField !== undefined && fromField.trim() !== '') return fromField.trim()
   return undefined
 }
 
@@ -206,7 +246,8 @@ async function resolveArtifact(ctx, config, sessionId) {
   if (header !== undefined && backend !== undefined && typeof backend.locate === 'function') {
     try {
       const located = backend.locate(header)
-      if (located !== undefined && typeof located.path === 'string' && located.path !== '') filePath = resolve(located.path)
+      const locatedText = locateTextOf(located)
+    if (locatedText !== undefined) filePath = resolve(locatedText)
     } catch {
       /* locate is a private extra: never fatal */
     }
@@ -293,7 +334,8 @@ async function deleteConversation(ctx, config, sessionId) {
    *
    * A Session that is neither live nor persisted is already gone; not an error.
    */
-  const registry = ctx.get('workspaceRegistry')
+  /* 同一个多路兜底：桌面版（较新的 DSH）strict 的 ctx.get 拿不到，非 strict / ctx.root 可能拿到 */
+  const registry = resolveWorkspaceRegistry(ctx).registry
   if (registry !== undefined) {
     try {
       await registry.archiveSession(sessionId, { stopActivity: true })
@@ -538,11 +580,12 @@ async function importConversation(ctx, config, buffer) {
   report.sessionId = header.id
 
   const located = backend.locate(header)
-  if (located === undefined || typeof located.path !== 'string' || located.path === '') {
+  const locatedText = locateTextOf(located)
+  if (locatedText === undefined) {
     report.error = 'the session backend did not return a target path for the imported header'
     return report
   }
-  const targetPath = resolve(located.path)
+  const targetPath = resolve(locatedText)
   const targetDir = dirname(targetPath)
   const root = sessionsRoot(ctx, config)
   if (!isInsideSessionDir(root, targetDir, header.id)) {
@@ -636,19 +679,69 @@ async function revealConversation(ctx, config, sessionId) {
   report.path = target
   report.kind = kind
 
-  const controller = ctx.get('sessionController')
-  if (controller === undefined || typeof controller.openWorkspacePath !== 'function') {
-    report.error = 'the Host cannot reach the desktop from this composition (no sessionController)'
+  /* 首选宿主的实现：它会先把路径过一遍 Host 校验，也负责桌面端的差异 */
+  const controller = resolveHostService(ctx, ['sessionController'], (value) => typeof value.openWorkspacePath === 'function').service
+  if (controller !== undefined) {
+    try {
+      await controller.openWorkspacePath({ path: target, action: 'reveal' }, AbortSignal.timeout(REVEAL_TIMEOUT_MS))
+      report.ok = true
+      report.via = 'sessionController'
+      return report
+    } catch (error) {
+      report.failures.push({ step: 'reveal', error: messageOf(error) })
+    }
+  }
+
+  /*
+   * 兜底：有些组合（实测：桌面版的插件 Host）没有 `sessionController`，那就自己叫系统文件管理器。
+   * 安全性：`target` 已经确认存在（上面 629 行），且用**参数数组**传（不经过 shell，不拼接命令）。
+   * detached + unref + stdio:ignore：不占用宿主进程，Explorer 退出码 1 也算成功（它一贯如此）。
+   */
+  const spawned = spawnReveal(target)
+  if (spawned.ok) {
+    report.ok = true
+    report.via = spawned.via
     return report
   }
-  try {
-    await controller.openWorkspacePath({ path: target, action: 'reveal' }, AbortSignal.timeout(REVEAL_TIMEOUT_MS))
-    report.ok = true
-  } catch (error) {
-    report.failures.push({ step: 'reveal', error: messageOf(error) })
-    report.error = messageOf(error)
+  if (spawned.error !== undefined) {
+    report.failures.push({ step: 'spawn', error: spawned.error })
+    report.error = spawned.error
+    return report
+  }
+  if (report.error === undefined) {
+    report.error = 'the Host cannot reach the desktop from this composition (no sessionController)'
   }
   return report
+}
+
+/**
+ * 不依赖 `sessionController` 的「在文件管理器里选中它」实现。
+ * @param target - an existing absolute path.
+ * @returns {{ok: boolean, via?: string, error?: string}}
+ */
+function spawnReveal(target) {
+  let command
+  let args
+  if (process.platform === 'win32') {
+    command = 'explorer.exe'
+    args = [`/select,${target}`]
+  } else if (process.platform === 'darwin') {
+    command = 'open'
+    args = ['-R', target]
+  } else {
+    /* Linux 没有统一的“选中”约定，退化成打开它所在的目录 */
+    command = 'xdg-open'
+    args = [dirname(target)]
+  }
+  try {
+    const child = spawn(command, args, { stdio: 'ignore', detached: true, windowsHide: true })
+    /* 必须挂 error 处理：ChildProcess 的 'error' 事件没有监听者会直接抛出去 */
+    child.on('error', () => {})
+    child.unref()
+    return { ok: true, via: command }
+  } catch (error) {
+    return { ok: false, error: messageOf(error) }
+  }
 }
 
 /* --------------------------------------------------------------- 更换工作区 */
@@ -668,7 +761,7 @@ async function revealConversation(ctx, config, sessionId) {
  * @param sessionId - the session whose cached header is stale.
  */
 async function refreshWorkspaceHeaderCache(ctx, sessionId) {
-  const registry = ctx.get('workspaceRegistry')
+  const registry = resolveWorkspaceRegistry(ctx).registry
   if (registry === undefined) return
   for (const method of ['invalidateSessionHeader', 'forgetSessionHeader', 'refreshSessionHeader', 'invalidateHeader']) {
     if (typeof registry[method] !== 'function') continue
@@ -697,11 +790,130 @@ function locatePath(backend, header) {
   if (backend === undefined || typeof backend.locate !== 'function') return undefined
   try {
     const located = backend.locate(header)
-    if (located !== undefined && typeof located.path === 'string' && located.path !== '') return resolve(located.path)
+    const text = locateTextOf(located)
+    if (text !== undefined) return resolve(text)
   } catch {
     /* never fatal: the caller falls back to the directory scan */
   }
   return undefined
+}
+
+/**
+ * 尽力取一个宿主服务：strict → 非 strict → `ctx.root` × 若干候选名字。
+ *
+ * **为什么不能只写 `ctx.get('x')`**：Cordis 4 的 `ctx.get(name)` 默认是 **strict** 的 ——
+ * 只返回「提供它的 fiber 当前处于 active」的实现，否则给 `undefined`。另外服务还可能被隔在
+ * 别的 `isolate` 作用域里，或者某个组合根本没把它交给插件（桌面版的插件 Host 就是这样：
+ * 实测 `workspaceRegistry` 与 `sessionController` 都拿不到，而 `sessions` /
+ * `sessionPersistence` / `webServer` / `typert` 都 active）。
+ * `usable` 用来确认拿到的真的是那个服务，而不是同名的别的东西。
+ *
+ * @param ctx - Host root context.
+ * @param names - candidate service names, most likely first.
+ * @param usable - optional predicate on the resolved value.
+ * @returns {{service: object|undefined, source: string|undefined}}
+ */
+function resolveHostService(ctx, names, usable) {
+  const scopes = [{ scope: ctx, label: 'ctx' }]
+  try {
+    if (ctx !== null && ctx !== undefined && ctx.root !== undefined && ctx.root !== null && ctx.root !== ctx) {
+      scopes.push({ scope: ctx.root, label: 'ctx.root' })
+    }
+  } catch {
+    /* root 拿不到就算了 */
+  }
+  for (const strict of [true, false]) {
+    for (const entry of scopes) {
+      for (const name of names) {
+        let value
+        try {
+          value = entry.scope.get(name, strict)
+        } catch {
+          continue
+        }
+        if (value === undefined || value === null) continue
+        if (usable !== undefined && usable(value) !== true) continue
+        return { service: value, source: `${entry.label}.get('${name}'${strict ? '' : ', false'})` }
+      }
+    }
+  }
+  return { service: undefined, source: undefined }
+}
+
+/**
+ * 找到工作区注册表：上面那个通用兜底的特例，额外要求拿到的真的像个注册表。
+ * @param ctx - Host root context.
+ * @returns {{registry: object|undefined, source: string|undefined}}
+ */
+function resolveWorkspaceRegistry(ctx) {
+  const found = resolveHostService(
+    ctx,
+    ['workspaceRegistry', 'workspaceController', 'workspaces', 'workspace'],
+    (value) => typeof value.list === 'function' && typeof value.get === 'function',
+  )
+  return { registry: found.service, source: found.source }
+}
+
+/**
+ * 取工作区实体上的某个方法（不同版本命名可能不同），返回**已绑定 this** 的函数。
+ * @param workspace - the registry's workspace entity.
+ * @param names - candidate method names, most likely first.
+ * @returns a bound function, or undefined when none exists.
+ */
+function pickWorkspaceMethod(workspace, names) {
+  if (workspace === null || workspace === undefined) return undefined
+  for (const name of names) {
+    let fn
+    try {
+      fn = workspace[name]
+    } catch {
+      continue
+    }
+    if (typeof fn === 'function') return fn.bind(workspace)
+  }
+  return undefined
+}
+
+/**
+ * 为某个目录拿到（必要时建立）一个工作区。
+ *
+ * 这一步原来放在浏览器半（调客户端的 `workspaces.create`），但它走的是 typert 网关 →
+ * `workspaceController` 这个 Service，而桌面版组合里那条路不通（`gateway/service-unavailable`）。
+ * 既然 Host 半本来就要用注册表来改账户归属，索性把「找/建工作区」也放到 Host：
+ * 少一次网关往返，也不再受客户端组合差异影响。
+ * @param registry - the workspace registry.
+ * @param targetPath - the directory the conversation should belong to.
+ * @returns {{workspace: object, created: boolean, path: string}}
+ */
+async function ensureWorkspaceForPath(registry, targetPath) {
+  const wanted = pathText(targetPath)
+  if (wanted === undefined) throw new Error('no usable directory path was given')
+  let canonical = resolve(wanted)
+  try {
+    canonical = await realpath(wanted)
+  } catch {
+    /* 目录不存在时 realpath 会抛：保持 resolve() 的结果，由调用方去报「目录不存在」 */
+  }
+  const existing = registry.list().find((workspace) => {
+    /* workspace.path 在桌面版是对象，必须先用 pathText 收敛（否则 path.resolve 会抛） */
+    const other = pathText(workspace.path)
+    if (other === undefined) return false
+    try {
+      return resolve(other) === canonical || other === wanted
+    } catch {
+      return false
+    }
+  })
+  if (existing !== undefined) return { workspace: existing, created: false, path: canonical }
+  if (typeof registry.create !== 'function') {
+    throw new Error('this composition exposes the workspace registry but not its create(); pick an existing workspace instead')
+  }
+  const created = await registry.create({ path: canonical })
+  const workspace = created !== null && typeof created === 'object' && created.workspace !== undefined ? created.workspace : created
+  if (workspace === undefined || workspace === null || typeof workspace.attachSession !== 'function') {
+    throw new Error('the workspace registry did not return a usable workspace for that directory')
+  }
+  return { workspace, created: true, path: canonical }
 }
 
 /**
@@ -711,32 +923,46 @@ function locatePath(backend, header) {
  * 所以这是一次**真正的搬家**：改写 cwd → 把日志挪到新 cwd 对应的项目目录 →
  * 再把工作区账户从旧工作区挪到新工作区（`attachSession` 会校验 cwd 必须等于工作区路径）。
  *
+ * 目标可以给 `workspaceId`（已有工作区），也可以只给 `path`（Host 自己去建/找）。
  * 任何一步失败都能恢复，顺序是刻意这样排的：
- *   1. 先把旧文件改名 aside —— 后端立刻不再认它，但字节还在原地；
- *   2. 再写新位置（临时文件 + rename）；
+ *   1. 把旧会话目录里的每个条目都搬进新目录（多代际一起走）；
+ *   2. 在新位置把权威代际那一份换成改写 cwd 后的字节；
  *   3. **回读验证**后端能在新位置认出这条会话（`stat` + `locate` 必须都指向新路径）；
- *   4. 验证通过才删旧目录；不通过就把新文件删掉、把旧文件改回来。
- * 全程不会出现「两份同时在」的状态（那会让后端报 duplicate session id）。
+ *   4. 验证通过才删掉（已空的）旧目录；不通过就整体回滚。
  */
-async function moveConversation(ctx, config, sessionId, workspaceId) {
+async function moveConversation(ctx, config, sessionId, workspaceId, targetDirectory) {
   const report = { ok: false, sessionId, workspaceId, from: undefined, to: undefined, verified: false, failures: [] }
   if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) {
     report.error = 'invalid session id'
     return report
   }
-  if (typeof workspaceId !== 'string' || workspaceId === '') {
+  const wantsPath = (workspaceId === undefined || workspaceId === null || workspaceId === '')
+  if (wantsPath && (typeof targetDirectory !== 'string' || targetDirectory === '')) {
+    report.error = 'invalid workspace id'
+    return report
+  }
+  if (!wantsPath && typeof workspaceId !== 'string') {
     report.error = 'invalid workspace id'
     return report
   }
 
-  const registry = ctx.get('workspaceRegistry')
+  const found = resolveWorkspaceRegistry(ctx)
+  const registry = found.registry
+  report.registrySource = found.source
   if (registry === undefined) {
     report.error = 'the workspace registry is unavailable in this composition'
     return report
   }
   let target
   try {
-    target = registry.get(workspaceId)
+    if (wantsPath) {
+      /* 只给了目录：Host 自己去找/建工作区（这样浏览器半不必依赖客户端网关的 workspace/create） */
+      const ensured = await ensureWorkspaceForPath(registry, targetDirectory)
+      target = ensured.workspace
+      report.workspaceCreated = ensured.created
+    } else {
+      target = registry.get(workspaceId)
+    }
   } catch (error) {
     report.error = messageOf(error)
     return report
@@ -745,7 +971,13 @@ async function moveConversation(ctx, config, sessionId, workspaceId) {
     report.error = 'no workspace has that id'
     return report
   }
-  const targetPath = resolve(target.path)
+  /* target.path 在桌面版是对象（web 版是字符串），一律先收敛成字符串再用 */
+  const targetText = pathText(target.path)
+  if (targetText === undefined) {
+    report.error = 'the workspace did not report a usable directory path'
+    return report
+  }
+  const targetPath = resolve(targetText)
   let targetIsDirectory = false
   try {
     targetIsDirectory = (await stat(targetPath)).isDirectory()
@@ -1005,21 +1237,53 @@ async function moveConversation(ctx, config, sessionId, workspaceId) {
   report.movedFile = { from: currentPath, to: newPath }
   report.movedEntries = moves.length
 
-  /* 账户归属：先挂到新工作区（它会校验 cwd == 工作区路径），再把别处的一律摘掉 */
+  /* 账户归属：先挂到新工作区（它会校验 cwd == 工作区路径），再把**其它每个**工作区上的它摘掉 */
   try {
     await target.attachSession(sessionId)
   } catch (error) {
     report.failures.push({ step: 'attach', error: messageOf(error) })
   }
+  const detachedFrom = []
+  for (const workspace of registry.list()) {
+    if (workspace.id === target.id) continue
+    /*
+     * **不要用 `workspace.sessionIds.includes(id)` 预判**。桌面版实测：那个 getter 会按 cwd 过滤，
+     * 搬完之后旧工作区根本「看不见」这条会话，预判永远是 false —— 于是 detach 被整段跳过，
+     * 旧账上一直留着这条 id，侧边栏就在新旧两个工作区里都列出它，点一个亮两个。
+     * 而 detach 的契约写明是**幂等**的（不在账上也不写），所以直接对每个其它工作区调一次即可。
+     */
+    const detach = pickWorkspaceMethod(workspace, ['detachSession', 'removeSession', 'detach', 'forgetSession'])
+    if (detach === undefined) {
+      report.failures.push({ step: 'detach', error: `workspace ${String(workspace.id)} exposes no detach method` })
+      continue
+    }
+    try {
+      await detach(sessionId)
+      detachedFrom.push(String(workspace.id))
+    } catch (error) {
+      report.failures.push({ step: 'detach', error: messageOf(error) })
+    }
+  }
+  report.detachedFrom = detachedFrom
+
+  /* 回读确认：别的账上不该再留着它（留着就是侧边栏重复显示的根） */
   try {
+    const stillAttached = []
     for (const workspace of registry.list()) {
       if (workspace.id === target.id) continue
-      if (Array.isArray(workspace.sessionIds) && workspace.sessionIds.includes(sessionId) && typeof workspace.detachSession === 'function') {
-        await workspace.detachSession(sessionId)
+      let ids
+      try {
+        ids = workspace.sessionIds
+      } catch {
+        ids = undefined
       }
+      if (Array.isArray(ids) && ids.includes(sessionId)) stillAttached.push(String(workspace.id))
     }
-  } catch (error) {
-    report.failures.push({ step: 'detach', error: messageOf(error) })
+    if (stillAttached.length > 0) {
+      report.failures.push({ step: 'detach-verify', error: `still accounted by workspace(s) ${stillAttached.join(', ')}` })
+    }
+  } catch {
+    /* 回读本身失败不影响搬迁结果 */
   }
 
   report.ok = report.failures.length === 0
@@ -1046,6 +1310,95 @@ function sendBytes(res, status, bytes, headers) {
 }
 
 /**
+ * 读 Loader 的插件条目状态（只读）。
+ *
+ * 排查「某个包为什么没挂上」时这是最直接的证据：桌面版里连 DSH 自己的「新建工作区」都报
+ * `active Service "workspaceController" is unavailable`，而 App 的日志目录是空的。
+ * Loader 的服务名就是 `loader`，`ctx.loader.entries()` 能拿到每个条目的
+ * `options.id` / `options.name` / `options.disabled` 与 `fiber.state`
+ * （Cordis 里 2 = active，其余为 pending / loading / failed / disposed）。
+ * @param ctx - Host root context.
+ * @returns {{available: boolean, error?: string, rows: object[]}}
+ */
+function loaderRows(ctx) {
+  const loader = resolveHostService(ctx, ['loader'], (value) => typeof value.entries === 'function').service
+  if (loader === undefined) return { available: false, rows: [] }
+  const rows = []
+  try {
+    for (const entry of loader.entries()) {
+      const options = entry !== null && entry !== undefined && entry.options !== undefined ? entry.options : {}
+      const fiber = entry !== null && entry !== undefined ? entry.fiber : undefined
+      const failure = fiber !== undefined && fiber !== null ? fiber.error : undefined
+      rows.push({
+        id: options.id === undefined || options.id === null ? undefined : String(options.id),
+        name: options.name === undefined || options.name === null ? undefined : String(options.name),
+        state: fiber === undefined || fiber === null || fiber.state === undefined ? undefined : Number(fiber.state),
+        disabled: options.disabled === true,
+        error: failure === undefined || failure === null ? undefined : String(failure.message !== undefined ? failure.message : failure).slice(0, 300),
+      })
+    }
+  } catch (error) {
+    return { available: true, rows, error: messageOf(error) }
+  }
+  return { available: true, rows }
+}
+
+/**
+ * 报告「这个组合里哪些能力真的可用」。
+ *
+ * 存在的理由很实际：同一个插件在 web profile 上「更换工作区」能用，在桌面版上却报
+ * `the workspace registry is unavailable in this composition` —— 因为 Cordis 4 的
+ * `ctx.get(name)` 默认 strict（只认提供者当前 active 的实现），而且服务可能被隔在别的 isolate
+ * 作用域里。光看客户端的报错根本判断不出是哪一层的问题，所以给一条专门的探测路由：
+ * 它把每个服务的解析结果、命中的来源、注册表里的工作区清单、以及 Loader 里没起来的插件条目
+ * 都吐出来。只读，不改任何状态。
+ * @param ctx - Host root context.
+ * @param config - plugin config.
+ */
+async function capabilitiesReport(ctx, config) {
+  const found = resolveWorkspaceRegistry(ctx)
+  const services = {}
+  for (const name of ['sessions', 'sessionPersistence', 'sessionController', 'webServer', 'sessionLogDownload', 'typert']) {
+    const found = resolveHostService(ctx, [name])
+    services[name] = found.service === undefined ? 'unavailable' : `available (${found.source})`
+  }
+
+  let workspaces = []
+  if (found.registry !== undefined) {
+    try {
+      workspaces = found.registry.list().map((workspace) => ({
+        id: String(workspace.id),
+        title: String(workspace.title),
+        path: pathText(workspace.path),
+        sessions: Array.isArray(workspace.sessionIds) ? workspace.sessionIds.length : undefined,
+      }))
+    } catch (error) {
+      workspaces = [{ error: messageOf(error) }]
+    }
+  }
+
+  /*
+   * Loader 里的插件条目：只挑「没起来」或与 workspace 有关的，
+   * 否则串太长。这一节就是回答「为什么这个服务不在」的直接证据。
+   */
+  const loader = loaderRows(ctx)
+  const interesting = loader.rows.filter((row) => row.state !== 2
+    || (row.id !== undefined && /workspace/i.test(row.id))
+    || (row.name !== undefined && /workspace/i.test(row.name)))
+
+  return {
+    ok: true,
+    sessionsRoot: sessionsRoot(ctx, config),
+    attachmentsRoot: attachmentsRoot(ctx, config),
+    workspaceRegistry: { available: found.registry !== undefined, source: found.source, workspaces },
+    workspaceCreate: found.registry !== undefined && typeof found.registry.create === 'function',
+    services,
+    plugins: { available: loader.available, error: loader.error, total: loader.rows.length, interesting },
+    routes: ['delete', 'export', 'import', 'reveal', 'move', 'capabilities'],
+  }
+}
+
+/**
  * Register the routes once the web carrier exists.
  * @param ctx - Host root context.
  * @param config - plugin config.
@@ -1055,7 +1408,8 @@ export function apply(ctx, config) {
   const jsonRoutes = [
     { path: '/conversation-delete/delete', run: (body) => deleteConversation(ctx, config, body.sessionId), okStatus: 200, failStatus: 409 },
     { path: '/conversation-delete/reveal', run: (body) => revealConversation(ctx, config, body.sessionId), okStatus: 200, failStatus: 409 },
-    { path: '/conversation-delete/move', run: (body) => moveConversation(ctx, config, body.sessionId, body.workspaceId), okStatus: 200, failStatus: 409 },
+    { path: '/conversation-delete/move', run: (body) => moveConversation(ctx, config, body.sessionId, body.workspaceId, body.path), okStatus: 200, failStatus: 409 },
+    { path: '/conversation-delete/capabilities', run: () => capabilitiesReport(ctx, config), okStatus: 200, failStatus: 409 },
   ]
 
   const routes = jsonRoutes.map((entry) => ({
