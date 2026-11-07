@@ -55,12 +55,12 @@
 
 ## 版本与下载
 
-| 版本 | 分支 | 标签 | 产物 | 说明 |
-| --- | --- | --- | --- | --- |
-| 1.1.0 | [`version/1.1.0`](../../tree/version/1.1.0) | [`v1.1.0`](../../releases/tag/v1.1.0) | `dsh-plugin-conversation-delete-1.1.0.tgz` | 对话工具箱：导出 / 打开文件位置 / 更换工作区 / 删除（会话行菜单）+ 导入（侧边栏底部） |
-| 1.0.0 | [`version/1.0.0`](../../tree/version/1.0.0) | [`v1.0.0`](../../releases/tag/v1.0.0) | `dsh-plugin-conversation-delete-1.0.0.tgz` | 首个版本：只有删除对话 |
+| 版本 | 标签 | 产物 | 说明 |
+| --- | --- | --- | --- |
+| 1.1.0 | [`v1.1.0`](../../releases/tag/v1.1.0) | `dsh-plugin-conversation-delete-1.1.0.tgz` | 对话工具箱：导出 / 打开文件位置 / 更换工作区 / 删除（会话行菜单）+ 导入（侧边栏底部） |
+| 1.0.0 | [`v1.0.0`](../../releases/tag/v1.0.0) | `dsh-plugin-conversation-delete-1.0.0.tgz` | 首个版本：只有删除对话 |
 
-每个版本另开 `version/<版本号>` 分支；`main` 不直接接收发布推送。
+`main` 是最新代码，已发布的版本固定在标签上。
 
 ---
 
